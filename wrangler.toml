@@ -15,10 +15,16 @@ binding = "AI"
 [vars]
 # Allowed browser origin(s) that may call this proxy.
 ALLOWED_ORIGIN = "https://kimyunsu1001-tech.github.io"
-# Free messages per visitor per day (roughly one short mock interview).
-DAILY_FREE_LIMIT = "14"
-# Hard cap on total free requests per day across ALL visitors, kept safely
-# under the free Workers AI daily budget so this can never incur cost.
-GLOBAL_DAILY_CAP = "400"
+# Free messages per visitor per day. Measured: a full ~9-turn interview on
+# this system prompt uses ~250 Neurons and grows with context length, so one
+# visitor could in theory run 2+ full interviews/day within this limit.
+DAILY_FREE_LIMIT = "30"
+# Hard cap on total free requests per day across ALL visitors. Measured real
+# cost: ~20-50 Neurons/request depending on how long the conversation has
+# grown, against a 10,000 Neuron/day free budget (no card on file, so
+# Cloudflare simply errors out past that — never bills). This cap is a loose
+# sanity ceiling; Cloudflare's own free quota binds first in practice, and
+# the Worker already falls back to "use your own key" gracefully either way.
+GLOBAL_DAILY_CAP = "1000"
 # Workers AI model used for the free trial (small/cheap = more free responses/day).
 FREE_MODEL = "@cf/meta/llama-3.1-8b-instruct-fp8"
