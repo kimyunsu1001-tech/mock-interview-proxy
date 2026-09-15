@@ -27,6 +27,18 @@ function jsonResponse(data, status, headers) {
   });
 }
 
+// 제시문면접 모드에서 소형 모델이 3~5문장짜리 제시문을 직접 창작하도록
+// 시키면 실패하는 경우가 많아(실측 확인됨), 서버가 미리 준비한 오리지널
+// 제시문(특정 대학 기출을 옮긴 것이 아닌 창작 예시) 중 하나를 결정적으로
+// 내려보낸다. 상위권 대학 구술고사처럼 하나의 개념을 상반된 두 시각으로
+// 제시하는 형식을 따른다.
+const PASSAGE_MARKER = "다음 제시문을 읽고 답변해 주세요.";
+const PRESENTATION_PASSAGES = [
+  "어떤 사회에서는 개인의 자유를 최우선 가치로 여겨, 타인에게 직접적인 해를 끼치지 않는 한 개인의 선택에 공동체가 간섭해서는 안 된다고 본다. 반면 다른 사회에서는 개인이 공동체 안에서만 의미를 가지며, 공동체 전체의 이익을 위해서는 개인의 자유가 일정 부분 제한될 수 있다고 본다. 두 입장은 '자유'라는 같은 단어를 쓰지만 그 의미와 한계를 서로 다르게 규정하고 있다.",
+  "최근 여러 분야에서 인공지능이 사람을 대신해 판단을 내리는 사례가 늘고 있다. 어떤 이들은 인공지능이 감정이나 편견 없이 데이터를 기반으로 판단하므로 오히려 더 공정할 수 있다고 주장한다. 반면 다른 이들은 판단의 결과에 책임질 수 없는 존재에게 중요한 결정을 맡기는 것 자체가 위험하며, 데이터 역시 인간이 만든 것이기에 편견에서 자유롭지 않다고 반박한다.",
+  "한정된 자원을 배분할 때, 한쪽에서는 가장 큰 성과를 낼 수 있는 곳에 자원을 집중해야 전체의 효용이 커진다고 주장한다. 다른 쪽에서는 이미 자원이 부족한 곳을 먼저 배려하지 않으면 격차가 점점 벌어져 장기적으로 공동체 전체가 불안정해진다고 반박한다. 이 두 입장은 '무엇을 위한 배분인가'라는 질문에 서로 다르게 답하고 있다.",
+];
+
 function rateLimitedResponse(message, headers, extra) {
   return jsonResponse(
     { error: { type: "rate_limit_exceeded", message }, ...extra },
@@ -88,22 +100,68 @@ export default {
       );
     }
 
-    // ---- Cloudflare Workers AI 호출 (무료, 카드 불필요) ----
-    // 소형 모델은 대화가 길어질수록 시스템 프롬프트의 세부 규칙(특히
-    // "매 턴 꼬리질문 포함")을 놓치는 경향이 있어, 매 요청마다 마지막
-    // 사용자 메시지 끝에 짧은 리마인더를 덧붙여 최신성(recency)을 이용해
-    // 규칙 준수를 강화한다. 클라이언트가 저장하는 대화 기록에는 영향을
-    // 주지 않는다 (여기서만 임시로 덧붙임).
-    // 대화가 길어지면(주 질문을 충분히 던졌으면) 소형 모델이 시스템 프롬프트의
-    // "10~14턴 후 마무리" 규칙을 잊고 질문을 무한히 늘리는 경향이 있어, 턴 수
-    // 기준으로 마무리를 강하게 유도한다.
     const exchangeCount = Math.floor(messages.length / 2); // 지원자 답변 수(대략)
-    const wrapUpNote =
-      exchangeCount >= 6
-        ? "\n5. 이미 충분히 많은 질문을 했습니다. 이번 응답에서는 새로운 주제로 " +
-          "넘어가지 말고 반드시 '마지막으로 하고 싶은 말씀이 있으면 해주세요.'라고 " +
-          "물으며 면접을 마무리하세요."
-        : "";
+
+    // ---- 제시문면접: 제시문 창작도 소형 모델에게 맡기지 않고 서버가 낸다 ----
+    const isPresentationStyle = system && system.includes("제시문 준비");
+    const passageAlreadyShown = messages.some(
+      (m) => m.role === "assistant" && m.content.includes(PASSAGE_MARKER)
+    );
+
+    if (isPresentationStyle && exchangeCount === 1 && !passageAlreadyShown) {
+      const passage =
+        PRESENTATION_PASSAGES[Math.floor(Math.random() * PRESENTATION_PASSAGES.length)];
+      const nextIp = ipCurrent + 1;
+      const nextGlobal = globalCurrent + 1;
+      await env.RATE_LIMIT.put(ipKey, String(nextIp), { expirationTtl: 172800 });
+      await env.RATE_LIMIT.put(globalKey, String(nextGlobal), { expirationTtl: 172800 });
+      return jsonResponse(
+        {
+          content: [
+            {
+              type: "text",
+              text: `네, 답변 잘 들었습니다.\n\n${PASSAGE_MARKER}\n\n${passage}\n\n이 제시문에서 다루는 핵심 쟁점은 무엇이라고 생각하십니까?`,
+            },
+          ],
+          remaining: Math.max(limit - nextIp, 0),
+          limit,
+        },
+        200,
+        cors
+      );
+    }
+
+    // ---- 면접 마무리는 소형 모델에게만 맡기지 않고 서버가 결정적으로 제어한다 ----
+    // 프롬프트 리마인더만으로는 소형 모델이 "10~14턴 후 마무리" 규칙을 계속
+    // 놓치고 질문을 무한히 이어가는 경우가 실측 확인되어, 턴 수를 직접 세어
+    // 임계값을 넘으면 AI 호출 없이 마무리 질문을 강제로 내려보낸다(비용도 절약).
+    const CLOSING_QUESTION = "마지막으로 하고 싶은 말씀이 있으면 해주세요.";
+    const lastAssistantMsg = [...messages].reverse().find((m) => m.role === "assistant");
+    const closingAlreadyAsked =
+      lastAssistantMsg && lastAssistantMsg.content.includes(CLOSING_QUESTION);
+
+    if (exchangeCount >= 7 && !closingAlreadyAsked) {
+      const nextIp = ipCurrent + 1;
+      const nextGlobal = globalCurrent + 1;
+      await env.RATE_LIMIT.put(ipKey, String(nextIp), { expirationTtl: 172800 });
+      await env.RATE_LIMIT.put(globalKey, String(nextGlobal), { expirationTtl: 172800 });
+      return jsonResponse(
+        {
+          content: [{ type: "text", text: `네, 답변 잘 들었습니다.\n\n${CLOSING_QUESTION}` }],
+          remaining: Math.max(limit - nextIp, 0),
+          limit,
+        },
+        200,
+        cors
+      );
+    }
+
+    const evalOnlyNote = closingAlreadyAsked
+      ? "\n5. 지원자가 방금 '마지막으로 하고 싶은 말씀'에 답했습니다. 이번 응답에서는 " +
+        "절대 새 질문을 하지 말고, 시스템 지침의 '평가 및 피드백' 형식(전체 총평, " +
+        "잘한 점, 보완점, 항목별 점수, 다음 연습 때 시도해볼 것)에 맞춰 면접 평가를 " +
+        "제공하세요."
+      : "";
 
     const REMINDER =
       "\n\n[진행 지침 리마인더 — 반드시 지키세요:\n" +
@@ -114,7 +172,7 @@ export default {
       "(2) 그 답변에 대한 꼬리질문 한 개.\n" +
       "3. 지원자가 한 말을 요약·재구성·인용하지 말고, 질문만 하세요.\n" +
       "4. 아직 면접 종료를 안내하지 않았다면 총평이나 점수는 절대 언급하지 마세요." +
-      wrapUpNote +
+      evalOnlyNote +
       "]";
 
     const model = env.FREE_MODEL || "@cf/meta/llama-3.1-8b-instruct";
