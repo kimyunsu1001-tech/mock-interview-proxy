@@ -1,0 +1,24 @@
+name = "mock-interview-proxy"
+main = "src/worker.js"
+compatibility_date = "2026-01-01"
+
+# Created via `npx wrangler kv namespace create RATE_LIMIT` — id filled in after creation.
+kv_namespaces = [
+  { binding = "RATE_LIMIT", id = "b0ce50a1d4d84b829eea55c11c3f3cbc" }
+]
+
+# Cloudflare Workers AI — free daily quota (10,000 Neurons/day), no card required,
+# resets every day at 00:00 UTC. No Anthropic key or billing involved.
+[ai]
+binding = "AI"
+
+[vars]
+# Allowed browser origin(s) that may call this proxy.
+ALLOWED_ORIGIN = "https://kimyunsu1001-tech.github.io"
+# Free messages per visitor per day (roughly one short mock interview).
+DAILY_FREE_LIMIT = "14"
+# Hard cap on total free requests per day across ALL visitors, kept safely
+# under the free Workers AI daily budget so this can never incur cost.
+GLOBAL_DAILY_CAP = "400"
+# Workers AI model used for the free trial (small/cheap = more free responses/day).
+FREE_MODEL = "@cf/meta/llama-3.1-8b-instruct-fp8"
