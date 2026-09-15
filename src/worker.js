@@ -89,10 +89,25 @@ export default {
     }
 
     // ---- Cloudflare Workers AI 호출 (무료, 카드 불필요) ----
+    // 소형 모델은 대화가 길어질수록 시스템 프롬프트의 세부 규칙(특히
+    // "매 턴 꼬리질문 포함")을 놓치는 경향이 있어, 매 요청마다 마지막
+    // 사용자 메시지 끝에 짧은 리마인더를 덧붙여 최신성(recency)을 이용해
+    // 규칙 준수를 강화한다. 클라이언트가 저장하는 대화 기록에는 영향을
+    // 주지 않는다 (여기서만 임시로 덧붙임).
+    const REMINDER =
+      "\n\n[진행 지침 리마인더: 반드시 위 시스템 지침의 진행 방식을 따르세요. " +
+      "한 번에 질문은 하나만 하고, 방금 답변에 대한 꼬리질문을 최소 1개 포함해 " +
+      "자연스럽게 이어가세요. 아직 면접 종료를 안내하지 않았다면 총평이나 점수를 " +
+      "절대 언급하지 마세요.]";
+
     const model = env.FREE_MODEL || "@cf/meta/llama-3.1-8b-instruct";
     const aiMessages = [
       ...(system ? [{ role: "system", content: system }] : []),
-      ...messages.map((m) => ({ role: m.role, content: m.content })),
+      ...messages.map((m, i) => {
+        const isLast = i === messages.length - 1;
+        const content = isLast && m.role === "user" ? `${m.content}${REMINDER}` : m.content;
+        return { role: m.role, content };
+      }),
     ];
 
     let aiResult;
