@@ -33,6 +33,9 @@ function jsonResponse(data, status, headers) {
 // 내려보낸다. 상위권 대학 구술고사처럼 하나의 개념을 상반된 두 시각으로
 // 제시하는 형식을 따른다.
 const PASSAGE_MARKER = "다음 제시문을 읽고 답변해 주세요.";
+// 프론트엔드(app.js)의 WARNING_MARKER와 반드시 동일한 문자열이어야 한다 —
+// 클라이언트가 이 마커로 시작하는 첫 줄을 분리해 경고 말풍선으로 렌더링한다.
+const WARNING_MARKER = "⚠️ 답변 확인:";
 const PRESENTATION_PASSAGES = [
   "어떤 사회에서는 개인의 자유를 최우선 가치로 여겨, 타인에게 직접적인 해를 끼치지 않는 한 개인의 선택에 공동체가 간섭해서는 안 된다고 본다. 반면 다른 사회에서는 개인이 공동체 안에서만 의미를 가지며, 공동체 전체의 이익을 위해서는 개인의 자유가 일정 부분 제한될 수 있다고 본다. 두 입장은 '자유'라는 같은 단어를 쓰지만 그 의미와 한계를 서로 다르게 규정하고 있다.",
   "최근 여러 분야에서 인공지능이 사람을 대신해 판단을 내리는 사례가 늘고 있다. 어떤 이들은 인공지능이 감정이나 편견 없이 데이터를 기반으로 판단하므로 오히려 더 공정할 수 있다고 주장한다. 반면 다른 이들은 판단의 결과에 책임질 수 없는 존재에게 중요한 결정을 맡기는 것 자체가 위험하며, 데이터 역시 인간이 만든 것이기에 편견에서 자유롭지 않다고 반박한다.",
@@ -174,19 +177,55 @@ export default {
       : "\n\n[진행 지침 리마인더 — 반드시 지키세요:\n" +
         "1. 당신은 오직 '면접관' 역할입니다. 지원자의 대사나 생각을 대신 쓰거나, " +
         "지원자의 답변 내용을 1인칭으로 이어서 서술하지 마세요.\n" +
-        "2. 이번 응답은 다음 순서로만 구성하세요: " +
-        "(0, 해당할 때만) '⚠️ 답변 확인: 이유' 한 줄 " +
+        "2. 이번 응답은 다음 두 가지로만 구성하세요: " +
         "(1) 한 문장 이내의 짧은 인정 표현(예: '네, 답변 잘 들었습니다.') " +
         "(2) 그 답변에 대한 꼬리질문 한 개.\n" +
         "3. 지원자가 한 말을 요약·재구성·인용하지 말고, 질문만 하세요.\n" +
-        "4. 아직 면접 종료를 안내하지 않았다면 총평이나 점수는 절대 언급하지 마세요.\n" +
-        "5. 지원자의 답변이 질문 의도와 명백히 다르거나, 사실상 회피했거나, " +
-        "'네'/'모르겠습니다'처럼 지나치게 짧고 성의 없거나, 반말·욕설 등 " +
-        "면접 태도에 맞지 않을 때만 위 (0)의 경고 줄을 붙이세요. 경고는 " +
-        "비난조가 아닌 담담한 사실 확인 어조로 이유를 한 문장으로 씁니다. " +
-        "정상적인 답변에는 절대 이 경고를 붙이지 마세요.]";
+        "4. 아직 면접 종료를 안내하지 않았다면 총평이나 점수는 절대 언급하지 마세요.]";
 
     const model = env.FREE_MODEL || "@cf/meta/llama-3.1-8b-instruct";
+
+    // ---- 답변 적절성 경고: 소형 모델은 긴 지침 속에 묻힌 "필요할 때만
+    // 경고를 붙여라" 규칙을 실측상 거의 따르지 않으므로(동문서답에도
+    // 경고 없음 확인됨), 본 응답 생성과 분리된 별도의 짧은 판정 호출로
+    // 결정적으로 처리한다. 판정 실패 시에는 경고 없이 조용히 넘어가
+    // 메인 면접 흐름에는 영향을 주지 않는다.
+    let relevanceWarning = null;
+    const lastUserMsg = [...messages].reverse().find((m) => m.role === "user");
+    if (exchangeCount >= 1 && lastAssistantMsg && lastUserMsg) {
+      try {
+        const judgePrompt =
+          `면접 질문과 지원자 답변을 보고 "적절" 또는 "부적절"로만 판정하는 ` +
+          `채점자입니다. 질문과 무관한 내용, 사실상 회피, "네"/"몰라요"처럼 ` +
+          `성의 없이 짧은 답변, 반말·욕설은 "부적절"입니다. 그 외에는 ` +
+          `"적절"입니다.\n\n` +
+          `예시 1\n질문: 자기소개를 해주세요.\n답변: 오늘 저녁 메뉴 고민중이에요.\n판정: 부적절 (질문과 무관한 내용으로 답함)\n\n` +
+          `예시 2\n질문: 자기소개를 해주세요.\n답변: 안녕하세요, 경영학과에 지원한 김OO입니다.\n판정: 적절\n\n` +
+          `예시 3\n질문: 지원 동기가 무엇인가요?\n답변: 몰라요.\n판정: 부적절 (지나치게 짧고 성의 없는 답변)\n\n` +
+          `예시 4\n질문: 지원 동기가 무엇인가요?\n답변: 그냥 되고 싶어서 왔는데.\n판정: 부적절 (면접에 맞지 않는 반말 표현)\n\n` +
+          `이제 아래를 판정하세요. "적절" 또는 "부적절 (이유)" 형식으로만 답하고 다른 말은 하지 마세요.\n\n` +
+          `질문: ${lastAssistantMsg.content.slice(0, 300)}\n` +
+          `답변: ${lastUserMsg.content.slice(0, 500)}\n` +
+          `판정:`;
+        const judgeResult = await env.AI.run(model, {
+          messages: [{ role: "user", content: judgePrompt }],
+          max_tokens: 80,
+          temperature: 0,
+        });
+        const judgeText = (
+          (judgeResult && (judgeResult.response || judgeResult.result?.response)) ||
+          ""
+        ).trim();
+        if (/부적절/.test(judgeText)) {
+          const reasonMatch = judgeText.match(/\(([^)]+)\)/);
+          relevanceWarning = (reasonMatch && reasonMatch[1].trim()) || "답변이 질문 의도와 다소 다른 것 같습니다.";
+        }
+      } catch (e) {
+        relevanceWarning = null;
+        console.error("답변 적절성 판정 호출 실패:", e && e.message);
+      }
+    }
+
     const aiMessages = [
       ...(system ? [{ role: "system", content: system }] : []),
       ...messages.map((m, i) => {
@@ -216,7 +255,16 @@ export default {
       );
     }
 
-    const text = aiResult && (aiResult.response || aiResult.result?.response);
+    let text = aiResult && (aiResult.response || aiResult.result?.response);
+    if (text && relevanceWarning) {
+      // 메인 생성 모델이 혹시 스스로도 경고 줄을 붙였다면 중복을 막기 위해
+      // 먼저 제거한 뒤, 판정 호출 결과를 유일한 경고로 맨 앞에 붙인다.
+      const withoutSelfWarning = text.replace(
+        /^\s*⚠️\s*답변\s*확인\s*:?[^\n]*\n?/,
+        ""
+      );
+      text = `${WARNING_MARKER} ${relevanceWarning}\n\n${withoutSelfWarning.trimStart()}`;
+    }
     if (!text) {
       return jsonResponse(
         {
