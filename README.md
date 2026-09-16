@@ -1,4 +1,4 @@
-# 모의면접 AI — 무자본 무료 체험 프록시
+# 모의 면접 AI — 무자본 무료 체험 프록시
 
 방문자가 API 키나 결제수단 없이도 하루 일정 횟수까지 모의면접을 무료로
 체험할 수 있게 해주는 Cloudflare Worker입니다. **Cloudflare Workers AI의
