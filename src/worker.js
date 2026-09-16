@@ -266,9 +266,12 @@ export default {
     let aiResult;
     try {
       // temperature 실측: 0.9는 긴 응답(평가)에서 의미 없는 문자열이 섞이는
-      // 붕괴 현상 발생, 0.7은 드물게 외국어 문자 한둘이 섞이는 미세한 흠,
-      // 0.5는 완전히 깨끗함. 0.6을 안전 마진을 둔 상한으로 채택.
-      aiResult = await env.AI.run(model, { messages: aiMessages, max_tokens: 1024, temperature: 0.6 });
+      // 붕괴 현상 발생, 0.7은 드물게 외국어 문자 한둘이 섞이는 미세한 흠.
+      // 한때 0.6을 안전 마진으로 채택했으나, 실사용 중 "이해도가提高
+      // 되었던가요?"처럼 한자가 섞이는 오류가 실제로 재현되어(2026-09-17),
+      // 0.5(실측상 완전히 깨끗함)로 다시 낮춤. 자유도보다 정확한 한국어
+      // 출력이 우선이라고 판단.
+      aiResult = await env.AI.run(model, { messages: aiMessages, max_tokens: 1024, temperature: 0.5 });
     } catch (e) {
       console.error("Workers AI error:", e && e.message);
       return jsonResponse(
