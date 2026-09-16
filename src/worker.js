@@ -159,6 +159,76 @@ export default {
       );
     }
 
+    const model = env.FREE_MODEL || "@cf/meta/llama-3.1-8b-instruct";
+
+    // ---- 답변 적절성 경고: 소형 모델은 "부적절하면 경고만 붙이고 새
+    // 질문은 하지 마라"는 지시를 실측상 안정적으로 따르지 못한다(경고는
+    // 붙이면서도 새 질문을 이어서 만들어내는 경우가 확인됨). 따라서 본
+    // 응답 생성 자체를 소형 모델에게 맡기지 않고, 별도의 짧은 판정
+    // 호출로만 부적절 여부를 확인한 뒤 서버가 직접 "경고 + 같은 질문
+    // 재요청"을 결정적으로 구성해 돌려준다(메인 생성 호출 자체를
+    // 생략하므로 비용도 절약된다). 마무리 질문 이후 턴에는 적용하지
+    // 않는다 — 그 시점은 평가로 바로 넘어가야 한다.
+    if (!closingAlreadyAsked && exchangeCount >= 1 && lastAssistantMsg) {
+      const lastUserMsg = [...messages].reverse().find((m) => m.role === "user");
+      if (lastUserMsg) {
+        let relevanceWarning = null;
+        try {
+          const judgePrompt =
+            `면접 질문과 지원자 답변을 보고 "적절" 또는 "부적절"로만 판정하는 ` +
+            `채점자입니다. 질문과 무관한 내용, 사실상 회피, "네"/"몰라요"처럼 ` +
+            `성의 없이 짧은 답변, 반말·욕설은 "부적절"입니다. 그 외에는 ` +
+            `"적절"입니다.\n\n` +
+            `예시 1\n질문: 자기소개를 해주세요.\n답변: 오늘 저녁 메뉴 고민중이에요.\n판정: 부적절 (질문과 무관한 내용으로 답함)\n\n` +
+            `예시 2\n질문: 자기소개를 해주세요.\n답변: 안녕하세요, 경영학과에 지원한 김OO입니다.\n판정: 적절\n\n` +
+            `예시 3\n질문: 지원 동기가 무엇인가요?\n답변: 몰라요.\n판정: 부적절 (지나치게 짧고 성의 없는 답변)\n\n` +
+            `예시 4\n질문: 지원 동기가 무엇인가요?\n답변: 그냥 되고 싶어서 왔는데.\n판정: 부적절 (면접에 맞지 않는 반말 표현)\n\n` +
+            `이제 아래를 판정하세요. "적절" 또는 "부적절 (이유)" 형식으로만 답하고 다른 말은 하지 마세요.\n\n` +
+            `질문: ${lastAssistantMsg.content.slice(0, 300)}\n` +
+            `답변: ${lastUserMsg.content.slice(0, 500)}\n` +
+            `판정:`;
+          const judgeResult = await env.AI.run(model, {
+            messages: [{ role: "user", content: judgePrompt }],
+            max_tokens: 80,
+            temperature: 0,
+          });
+          const judgeText = (
+            (judgeResult && (judgeResult.response || judgeResult.result?.response)) ||
+            ""
+          ).trim();
+          if (/부적절/.test(judgeText)) {
+            const reasonMatch = judgeText.match(/\(([^)]+)\)/);
+            relevanceWarning =
+              (reasonMatch && reasonMatch[1].trim()) || "답변이 질문 의도와 다소 다른 것 같습니다.";
+          }
+        } catch (e) {
+          relevanceWarning = null;
+          console.error("답변 적절성 판정 호출 실패:", e && e.message);
+        }
+
+        if (relevanceWarning) {
+          const nextIp = ipCurrent + 1;
+          const nextGlobal = globalCurrent + 1;
+          await env.RATE_LIMIT.put(ipKey, String(nextIp), { expirationTtl: 172800 });
+          await env.RATE_LIMIT.put(globalKey, String(nextGlobal), { expirationTtl: 172800 });
+          return jsonResponse(
+            {
+              content: [
+                {
+                  type: "text",
+                  text: `${WARNING_MARKER} ${relevanceWarning}\n\n${lastAssistantMsg.content}`,
+                },
+              ],
+              remaining: Math.max(limit - nextIp, 0),
+              limit,
+            },
+            200,
+            cors
+          );
+        }
+      }
+    }
+
     // 마무리 질문 다음 턴은 "질문하지 말고 평가만 하라"는 지시가 일반
     // 꼬리질문 리마인더(질문을 반드시 하라는 규칙 포함)와 섞이면 소형
     // 모델이 지침 충돌로 다시 질문을 만들어내는 경우가 실측 확인되어,
@@ -168,9 +238,10 @@ export default {
         "지원자가 방금 '마지막으로 하고 싶은 말씀'에 답했습니다. 면접은 이미 끝났습니다.\n" +
         "1. 절대 새 질문을 하지 마세요. 꼬리질문도 하지 마세요.\n" +
         "2. 오직 아래 형식의 면접 평가만 작성하세요:\n" +
-        "   - 전체 총평 (3~4문장)\n" +
-        "   - 잘한 점 2~3가지 (실제 답변을 인용하며 설명)\n" +
-        "   - 보완이 필요한 점 2~3가지 (실제 답변을 인용하며 설명)\n" +
+        "   - 전체 총평 (2~3문장)\n" +
+        "   - 총점: XX점 / 100점 (감점·가점 요인을 1~2문장으로 구체적으로 밝힐 것. 무조건 후하게 주지 말 것)\n" +
+        "   - 강점 2~3가지 (실제 답변을 인용하며 설명)\n" +
+        "   - 단점(보완이 필요한 점) 2~3가지 (실제 답변을 인용하며 구체적으로 지적)\n" +
         "   - 항목별 점수 (5점 만점): 지원동기 적합성 / 지원분야 이해도 / " +
         "경험의 구체성 / 태도 및 전달력\n" +
         "   - 다음 연습 때 시도해볼 것 1~2가지]"
@@ -182,49 +253,6 @@ export default {
         "(2) 그 답변에 대한 꼬리질문 한 개.\n" +
         "3. 지원자가 한 말을 요약·재구성·인용하지 말고, 질문만 하세요.\n" +
         "4. 아직 면접 종료를 안내하지 않았다면 총평이나 점수는 절대 언급하지 마세요.]";
-
-    const model = env.FREE_MODEL || "@cf/meta/llama-3.1-8b-instruct";
-
-    // ---- 답변 적절성 경고: 소형 모델은 긴 지침 속에 묻힌 "필요할 때만
-    // 경고를 붙여라" 규칙을 실측상 거의 따르지 않으므로(동문서답에도
-    // 경고 없음 확인됨), 본 응답 생성과 분리된 별도의 짧은 판정 호출로
-    // 결정적으로 처리한다. 판정 실패 시에는 경고 없이 조용히 넘어가
-    // 메인 면접 흐름에는 영향을 주지 않는다.
-    let relevanceWarning = null;
-    const lastUserMsg = [...messages].reverse().find((m) => m.role === "user");
-    if (exchangeCount >= 1 && lastAssistantMsg && lastUserMsg) {
-      try {
-        const judgePrompt =
-          `면접 질문과 지원자 답변을 보고 "적절" 또는 "부적절"로만 판정하는 ` +
-          `채점자입니다. 질문과 무관한 내용, 사실상 회피, "네"/"몰라요"처럼 ` +
-          `성의 없이 짧은 답변, 반말·욕설은 "부적절"입니다. 그 외에는 ` +
-          `"적절"입니다.\n\n` +
-          `예시 1\n질문: 자기소개를 해주세요.\n답변: 오늘 저녁 메뉴 고민중이에요.\n판정: 부적절 (질문과 무관한 내용으로 답함)\n\n` +
-          `예시 2\n질문: 자기소개를 해주세요.\n답변: 안녕하세요, 경영학과에 지원한 김OO입니다.\n판정: 적절\n\n` +
-          `예시 3\n질문: 지원 동기가 무엇인가요?\n답변: 몰라요.\n판정: 부적절 (지나치게 짧고 성의 없는 답변)\n\n` +
-          `예시 4\n질문: 지원 동기가 무엇인가요?\n답변: 그냥 되고 싶어서 왔는데.\n판정: 부적절 (면접에 맞지 않는 반말 표현)\n\n` +
-          `이제 아래를 판정하세요. "적절" 또는 "부적절 (이유)" 형식으로만 답하고 다른 말은 하지 마세요.\n\n` +
-          `질문: ${lastAssistantMsg.content.slice(0, 300)}\n` +
-          `답변: ${lastUserMsg.content.slice(0, 500)}\n` +
-          `판정:`;
-        const judgeResult = await env.AI.run(model, {
-          messages: [{ role: "user", content: judgePrompt }],
-          max_tokens: 80,
-          temperature: 0,
-        });
-        const judgeText = (
-          (judgeResult && (judgeResult.response || judgeResult.result?.response)) ||
-          ""
-        ).trim();
-        if (/부적절/.test(judgeText)) {
-          const reasonMatch = judgeText.match(/\(([^)]+)\)/);
-          relevanceWarning = (reasonMatch && reasonMatch[1].trim()) || "답변이 질문 의도와 다소 다른 것 같습니다.";
-        }
-      } catch (e) {
-        relevanceWarning = null;
-        console.error("답변 적절성 판정 호출 실패:", e && e.message);
-      }
-    }
 
     const aiMessages = [
       ...(system ? [{ role: "system", content: system }] : []),
@@ -255,16 +283,7 @@ export default {
       );
     }
 
-    let text = aiResult && (aiResult.response || aiResult.result?.response);
-    if (text && relevanceWarning) {
-      // 메인 생성 모델이 혹시 스스로도 경고 줄을 붙였다면 중복을 막기 위해
-      // 먼저 제거한 뒤, 판정 호출 결과를 유일한 경고로 맨 앞에 붙인다.
-      const withoutSelfWarning = text.replace(
-        /^\s*⚠️\s*답변\s*확인\s*:?[^\n]*\n?/,
-        ""
-      );
-      text = `${WARNING_MARKER} ${relevanceWarning}\n\n${withoutSelfWarning.trimStart()}`;
-    }
+    const text = aiResult && (aiResult.response || aiResult.result?.response);
     if (!text) {
       return jsonResponse(
         {
