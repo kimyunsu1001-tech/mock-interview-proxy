@@ -73,6 +73,18 @@ export default {
     }
 
     const { system, messages } = body || {};
+
+    // 클라이언트가 보내는 이번 턴의 진행 단계(꼬리질문 유형·주 질문 등). 신뢰할 수 없는
+    // 입력이므로 종류를 화이트리스트로 제한하고 길이를 자른다.
+    const TURN_KINDS = new Set(["open", "followup", "main", "passage", "closing", "evaluate"]);
+    let turn = null;
+    if (body && body.turn && typeof body.turn === "object" && TURN_KINDS.has(body.turn.kind)) {
+      turn = {
+        kind: body.turn.kind,
+        question: typeof body.turn.question === "string" ? body.turn.question.slice(0, 300) : null,
+        hint: typeof body.turn.hint === "string" ? body.turn.hint.slice(0, 300) : null,
+      };
+    }
     if (!Array.isArray(messages)) {
       return jsonResponse({ error: { message: "messages required" } }, 400, cors);
     }
@@ -105,61 +117,30 @@ export default {
 
     const exchangeCount = Math.floor(messages.length / 2); // 지원자 답변 수(대략)
 
-    // ---- 제시문면접: 제시문 창작도 소형 모델에게 맡기지 않고 서버가 낸다 ----
     const isPresentationStyle = system && system.includes("제시문 준비");
     const passageAlreadyShown = messages.some(
       (m) => m.role === "assistant" && m.content.includes(PASSAGE_MARKER)
     );
-
-    if (isPresentationStyle && exchangeCount === 1 && !passageAlreadyShown) {
-      const passage =
-        PRESENTATION_PASSAGES[Math.floor(Math.random() * PRESENTATION_PASSAGES.length)];
-      const nextIp = ipCurrent + 1;
-      const nextGlobal = globalCurrent + 1;
-      await env.RATE_LIMIT.put(ipKey, String(nextIp), { expirationTtl: 172800 });
-      await env.RATE_LIMIT.put(globalKey, String(nextGlobal), { expirationTtl: 172800 });
-      return jsonResponse(
-        {
-          content: [
-            {
-              type: "text",
-              text: `네, 답변 잘 들었습니다.\n\n${PASSAGE_MARKER}\n\n${passage}\n\n이 제시문에서 다루는 핵심 쟁점은 무엇이라고 생각하십니까?`,
-            },
-          ],
-          remaining: Math.max(limit - nextIp, 0),
-          limit,
-        },
-        200,
-        cors
-      );
-    }
-
-    // ---- 면접 마무리는 소형 모델에게만 맡기지 않고 서버가 결정적으로 제어한다 ----
-    // 프롬프트 리마인더만으로는 소형 모델이 "10~14턴 후 마무리" 규칙을 계속
-    // 놓치고 질문을 무한히 이어가는 경우가 실측 확인되어, 턴 수를 직접 세어
-    // 임계값을 넘으면 AI 호출 없이 마무리 질문을 강제로 내려보낸다(비용도 절약).
     const CLOSING_QUESTION = "마지막으로 하고 싶은 말씀이 있으면 해주세요.";
     const lastAssistantMsg = [...messages].reverse().find((m) => m.role === "assistant");
     const closingAlreadyAsked =
       lastAssistantMsg && lastAssistantMsg.content.includes(CLOSING_QUESTION);
+    const model = env.FREE_MODEL || "@cf/meta/llama-3.1-8b-instruct";
 
-    if (exchangeCount >= 7 && !closingAlreadyAsked) {
+    // AI 호출 없이 서버가 직접 만든 응답을 내려보내고 사용량을 1 올린다.
+    const respondText = async (text) => {
       const nextIp = ipCurrent + 1;
       const nextGlobal = globalCurrent + 1;
       await env.RATE_LIMIT.put(ipKey, String(nextIp), { expirationTtl: 172800 });
       await env.RATE_LIMIT.put(globalKey, String(nextGlobal), { expirationTtl: 172800 });
       return jsonResponse(
-        {
-          content: [{ type: "text", text: `네, 답변 잘 들었습니다.\n\n${CLOSING_QUESTION}` }],
-          remaining: Math.max(limit - nextIp, 0),
-          limit,
-        },
+        { content: [{ type: "text", text }], remaining: Math.max(limit - nextIp, 0), limit },
         200,
         cors
       );
-    }
-
-    const model = env.FREE_MODEL || "@cf/meta/llama-3.1-8b-instruct";
+    };
+    const ACKS = ["네, 답변 잘 들었습니다.", "네, 잘 들었습니다.", "알겠습니다.", "말씀 잘 들었습니다.", "네, 알겠습니다."];
+    const ack = () => ACKS[Math.floor(Math.random() * ACKS.length)];
 
     // ---- 답변 적절성 경고: 소형 모델은 "부적절하면 경고만 붙이고 새
     // 질문은 하지 마라"는 지시를 실측상 안정적으로 따르지 못한다(경고는
@@ -229,6 +210,30 @@ export default {
       }
     }
 
+    // ---- 판정을 통과한 뒤: 서버가 결정적으로 내려보내는 응답 ----
+    // 소형 모델은 제시문 창작·주 질문 전환·마무리 시점을 지시만으로는 안정적으로
+    // 지키지 못해(실측 확인), 이런 턴은 AI 생성 없이 서버가 직접 응답한다.
+    // 꼬리질문만 AI가 답변 내용에 맞춰 만든다. turn이 없는 구버전 클라이언트는
+    // 예전 방식(제시문 삽입, 7번째 답변 뒤 마무리)으로 처리한다.
+    const kind = turn && turn.kind;
+    if (!closingAlreadyAsked) {
+      const wantPassage =
+        kind === "passage" || (!turn && isPresentationStyle && exchangeCount === 1);
+      if (wantPassage && !passageAlreadyShown) {
+        const passage =
+          PRESENTATION_PASSAGES[Math.floor(Math.random() * PRESENTATION_PASSAGES.length)];
+        return respondText(
+          `네, 답변 잘 들었습니다.\n\n${PASSAGE_MARKER}\n\n${passage}\n\n이 제시문에서 다루는 핵심 쟁점은 무엇이라고 생각하십니까?`
+        );
+      }
+      if (kind === "closing" || (!turn && exchangeCount >= 7)) {
+        return respondText(`${ack()}\n\n${CLOSING_QUESTION}`);
+      }
+      if (kind === "main" && turn.question) {
+        return respondText(`${ack()}\n\n${turn.question}`);
+      }
+    }
+
     // 마무리 질문 다음 턴은 "질문하지 말고 평가만 하라"는 지시가 일반
     // 꼬리질문 리마인더(질문을 반드시 하라는 규칙 포함)와 섞이면 소형
     // 모델이 지침 충돌로 다시 질문을 만들어내는 경우가 실측 확인되어,
@@ -254,9 +259,18 @@ export default {
         "지원자의 답변 내용을 1인칭으로 이어서 서술하지 마세요.\n" +
         "2. 이번 응답은 다음 두 가지로만 구성하세요: " +
         "(1) 한 문장 이내의 짧은 인정 표현(예: '네, 답변 잘 들었습니다.') " +
-        "(2) 그 답변에 대한 꼬리질문 한 개.\n" +
+        (kind === "main" && turn.hint
+          ? `(2) ${turn.hint}을 딱 한 개.\n`
+          : "(2) 그 답변에 대한 꼬리질문 한 개.\n") +
         "3. 지원자가 한 말을 요약·재구성·인용하지 말고, 질문만 하세요.\n" +
-        "4. 아직 면접 종료를 안내하지 않았다면 총평이나 점수는 절대 언급하지 마세요.]";
+        "4. 아직 면접 종료를 안내하지 않았다면 총평이나 점수는 절대 언급하지 마세요." +
+        (kind === "followup" && turn.hint
+          ? "\n5. 이번 꼬리질문은 아래 유형으로 하세요. 지원자의 방금 답변에 나온 핵심 단어를 " +
+            "질문 안에 자연스럽게 넣어 그 답변에 곧바로 이어지는 질문으로 만드세요 " +
+            "(답변을 길게 다시 말하지는 마세요). 질문은 한 문장으로 끝내세요.\n" +
+            `   이번 유형: ${turn.hint}`
+          : "") +
+        "]";
 
     const aiMessages = [
       ...(system ? [{ role: "system", content: system }] : []),
@@ -276,6 +290,15 @@ export default {
       // 0.5(실측상 완전히 깨끗함)로 다시 낮춤. 자유도보다 정확한 한국어
       // 출력이 우선이라고 판단.
       aiResult = await env.AI.run(model, { messages: aiMessages, max_tokens: 1024, temperature: 0.5 });
+      // 평가 턴은 총점·강점·단점이 빠지는 경우가 가끔 있어(소형 모델), 빠졌으면 한 번 더 생성한다.
+      if (closingAlreadyAsked) {
+        const evalText = (r) => (r && (r.response || r.result?.response)) || "";
+        const complete = (t) => /총점/.test(t) && /강점/.test(t) && /단점/.test(t);
+        if (!complete(evalText(aiResult))) {
+          const retry = await env.AI.run(model, { messages: aiMessages, max_tokens: 1024, temperature: 0.5 });
+          if (complete(evalText(retry)) || !evalText(aiResult)) aiResult = retry;
+        }
+      }
     } catch (e) {
       console.error("Workers AI error:", e && e.message);
       return jsonResponse(

@@ -18,7 +18,7 @@ ALLOWED_ORIGIN = "https://kimyunsu1001-tech.github.io"
 # Free messages per visitor per day. Measured: a full ~9-turn interview on
 # this system prompt uses ~250 Neurons and grows with context length, so one
 # visitor could in theory run 2+ full interviews/day within this limit.
-DAILY_FREE_LIMIT = "30"
+DAILY_FREE_LIMIT = "60"
 # Hard cap on total free requests per day across ALL visitors. Measured real
 # cost: ~20-50 Neurons/request depending on how long the conversation has
 # grown, against a 10,000 Neuron/day free budget (no card on file, so
